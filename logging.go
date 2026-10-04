@@ -36,6 +36,9 @@ func init() {
 	RegisterModule(StdoutWriter{})
 	RegisterModule(StderrWriter{})
 	RegisterModule(DiscardWriter{})
+	log.SetFlags(0)
+	log.SetPrefix("")
+	log.SetOutput(standardLogWriter{})
 }
 
 // Logging facilitates logging within Caddy. The default log is
@@ -78,6 +81,7 @@ type Logging struct {
 	// must have their keys added to this list so they
 	// can be closed when cleaning up
 	writerKeys []string
+	defaultLog *defaultCustomLog
 }
 
 // openLogs sets up the config and opens all the configured writers.
@@ -86,6 +90,7 @@ type Logging struct {
 func (logging *Logging) openLogs(ctx Context) error {
 	// make sure to deallocate resources when context is done
 	ctx.OnCancel(func() {
+		logging.deactivateDefault()
 		err := logging.closeLogs()
 		if err != nil {
 			Log().Error("closing logs", zap.Error(err))
@@ -169,10 +174,7 @@ func (logging *Logging) setupNewDefault(ctx Context) error {
 	newDefault.logger = zap.New(filteringCore, options...)
 
 	// redirect the default caddy logs
-	defaultLoggerMu.Lock()
-	oldDefault := defaultLogger
-	defaultLogger = newDefault
-	defaultLoggerMu.Unlock()
+	oldDefault := logging.activateDefault(newDefault)
 
 	// if the new writer is different, indicate it in the logs for convenience
 	var newDefaultLogWriterKey, currentDefaultLogWriterKey string
@@ -186,7 +188,7 @@ func (logging *Logging) setupNewDefault(ctx Context) error {
 		currentDefaultLogWriterStr = oldDefault.writerOpener.String()
 	}
 	if newDefaultLogWriterKey != currentDefaultLogWriterKey {
-		oldDefault.logger.Info("redirected default logger",
+		newDefault.logger.Info("redirected default logger",
 			zap.String("from", currentDefaultLogWriterStr),
 			zap.String("to", newDefaultLogWriterStr),
 		)
@@ -447,6 +449,7 @@ func (cl *BaseLog) buildOptions() ([]zap.Option, error) {
 // the "sink" logger.
 type SinkLog struct {
 	BaseLog
+	logger *zap.Logger
 }
 
 func (sll *SinkLog) provision(ctx Context, logging *Logging) error {
@@ -459,8 +462,7 @@ func (sll *SinkLog) provision(ctx Context, logging *Logging) error {
 		return err
 	}
 
-	logger := zap.New(sll.core, options...)
-	ctx.cleanupFuncs = append(ctx.cleanupFuncs, zap.RedirectStdLog(logger))
+	sll.logger = zap.New(sll.core, options...)
 	return nil
 }
 
@@ -722,10 +724,6 @@ func newDefaultProductionLog() (*defaultCustomLog, error) {
 
 	logger := zap.New(cl.core)
 
-	// capture logs from other libraries which
-	// may not be using zap logging directly
-	_ = zap.RedirectStdLog(logger)
-
 	return &defaultCustomLog{
 		CustomLog: cl,
 		logger:    logger,
@@ -793,14 +791,18 @@ func BufferedLog() (*zap.Logger, *zap.Logger, *internal.LogBufferCore) {
 	defer defaultLoggerMu.Unlock()
 	origLogger := defaultLogger.logger
 	bufferCore := internal.NewLogBufferCore(zap.InfoLevel)
-	defaultLogger.logger = zap.New(bufferCore)
+	buffered := *defaultLogger
+	buffered.logger = zap.New(bufferCore)
+	defaultLogger = &buffered
 	return defaultLogger.logger, origLogger, bufferCore
 }
 
 var (
-	coloringEnabled  = os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "xterm-mono"
-	defaultLogger, _ = newDefaultProductionLog()
-	defaultLoggerMu  sync.RWMutex
+	coloringEnabled            = os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "xterm-mono"
+	productionDefaultLogger, _ = newDefaultProductionLog()
+	defaultLogger              = productionDefaultLogger
+	standardLogLogger          = defaultLogger.logger.WithOptions(zap.AddCallerSkip(3))
+	defaultLoggerMu            sync.RWMutex
 )
 
 var writers = NewUsagePool()

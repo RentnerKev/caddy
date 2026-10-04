@@ -38,8 +38,8 @@ import (
 // that spawned the modules which are loaded. It should be used
 // with care and wrapped with derivation functions from the
 // standard context package only if you don't need the Caddy
-// specific features. These contexts are canceled when the
-// lifetime of the modules loaded from it is over.
+// specific features. Cancellation retires the context; module cleanup can
+// be delayed until its cleanup holds have been released.
 //
 // Use NewContext() to get a valid value (but most modules will
 // not actually need to do this).
@@ -49,7 +49,7 @@ type Context struct {
 	moduleInstances map[string][]Module
 	cfg             *Config
 	ancestry        []Module
-	cleanupFuncs    []func()                // invoked at every config unload
+	cleanup         *contextCleanup
 	exitFuncs       []func(context.Context) // invoked at config unload ONLY IF the process is exiting (EXPERIMENTAL)
 	metricsRegistry *prometheus.Registry
 }
@@ -70,34 +70,53 @@ func NewContext(ctx Context) (Context, context.CancelFunc) {
 // NewContextWithCause is like NewContext but returns a context.CancelCauseFunc.
 // EXPERIMENTAL: This API is subject to change.
 func NewContextWithCause(ctx Context) (Context, context.CancelCauseFunc) {
-	newCtx := Context{moduleInstances: make(map[string][]Module), cfg: ctx.cfg, metricsRegistry: prometheus.NewPedanticRegistry()}
+	instances := make(map[string][]Module)
 	c, cancel := context.WithCancelCause(ctx.Context)
+	cleanup := newContextCleanup(c, instances)
+	newCtx := Context{
+		Context:         c,
+		moduleInstances: instances,
+		cfg:             ctx.cfg,
+		cleanup:         cleanup,
+		metricsRegistry: prometheus.NewPedanticRegistry(),
+	}
+	cleanup.watchParent(context.AfterFunc(ctx.Context, func() {
+		cancel(context.Cause(ctx.Context))
+		cleanup.retire()
+	}))
 	wrappedCancel := func(cause error) {
 		cancel(cause)
-
-		for _, f := range ctx.cleanupFuncs {
-			f()
-		}
-
-		for modName, modInstances := range newCtx.moduleInstances {
-			for _, inst := range modInstances {
-				if cu, ok := inst.(CleanerUpper); ok {
-					err := cu.Cleanup()
-					if err != nil {
-						log.Printf("[ERROR] %s (%p): cleanup: %v", modName, inst, err)
-					}
-				}
-			}
-		}
+		cleanup.retire()
 	}
-	newCtx.Context = c
 	newCtx.initMetrics()
 	return newCtx, wrappedCancel
 }
 
-// OnCancel executes f when ctx is canceled.
+// OnCancel executes f after ctx is canceled, all cleanup holds are released,
+// and its modules have been cleaned up. Callbacks registered through copies
+// of ctx share the same cleanup lifetime.
 func (ctx *Context) OnCancel(f func()) {
-	ctx.cleanupFuncs = append(ctx.cleanupFuncs, f)
+	ctx.cleanup.onCancel(f)
+}
+
+// HoldCleanup prevents the context's modules and OnCancel callbacks from being
+// cleaned up until the returned function is called. Multiple holders may defer
+// cleanup independently, and each release function may be called more than once.
+// Cancellation, including Done and its cause, is not delayed by cleanup holds.
+// Acquire holds before cancellation; acquiring one after cancellation or after
+// cleanup has been requested returns a no-op. Holds only protect this context's
+// resources, not those loaded in a parent context.
+//
+// EXPERIMENTAL: This API is subject to change.
+func (ctx Context) HoldCleanup() func() {
+	if ctx.cleanup == nil || ctx.Err() != nil {
+		return func() {}
+	}
+	release, ok := ctx.cleanup.acquire()
+	if !ok {
+		return func() {}
+	}
+	return release
 }
 
 // FileSystems returns a ref to the FilesystemMap.
@@ -362,6 +381,20 @@ func (ctx Context) loadModuleMap(namespace string, val reflect.Value) (map[strin
 // dynamically loading/unloading modules in their own context,
 // like from embedded scripts, etc.
 func (ctx Context) LoadModuleByID(id string, rawMsg json.RawMessage) (any, error) {
+	// A parent can be canceled while a module is being provisioned. Keep its
+	// resources alive until provisioning and registration (or failure cleanup)
+	// finish, and reject new loads once this context has been retired.
+	if ctx.cleanup != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("loading module %s: context canceled: %w", id, context.Cause(ctx.Context))
+		}
+		release, ok := ctx.cleanup.acquire()
+		if !ok {
+			return nil, fmt.Errorf("loading module %s: context cleanup already requested", id)
+		}
+		defer release()
+	}
+
 	modulesMu.RLock()
 	modInfo, ok := modules[id]
 	modulesMu.RUnlock()
@@ -451,7 +484,14 @@ func (ctx Context) LoadModuleByID(id string, rawMsg json.RawMessage) (any, error
 		}
 	}
 
-	ctx.moduleInstances[id] = append(ctx.moduleInstances[id], val)
+	if ctx.cleanup != nil {
+		ctx.cleanup.mu.Lock()
+		ctx.moduleInstances[id] = append(ctx.moduleInstances[id], val)
+		ctx.cleanup.moduleOrder = append(ctx.cleanup.moduleOrder, cleanupModule{name: id, instance: val})
+		ctx.cleanup.mu.Unlock()
+	} else {
+		ctx.moduleInstances[id] = append(ctx.moduleInstances[id], val)
+	}
 
 	// if the loaded module happens to be an app that can emit events, store it so the
 	// core can have access to emit events without an import cycle
@@ -674,7 +714,7 @@ func (ctx *Context) WithValue(key, value any) Context {
 		moduleInstances: ctx.moduleInstances,
 		cfg:             ctx.cfg,
 		ancestry:        ctx.ancestry,
-		cleanupFuncs:    ctx.cleanupFuncs,
+		cleanup:         ctx.cleanup,
 		exitFuncs:       ctx.exitFuncs,
 		metricsRegistry: ctx.metricsRegistry,
 	}

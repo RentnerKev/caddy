@@ -29,6 +29,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -416,8 +417,8 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 // This is a low-level function; most callers
 // will want to use Run instead, which also
 // updates the config's raw state.
-func run(newCfg *Config, start bool) (Context, error) {
-	ctx, err := provisionContext(newCfg, start)
+func run(newCfg *Config, start bool) (ctx Context, err error) {
+	ctx, err = provisionContext(newCfg, start)
 	if err != nil {
 		globalMetrics.configSuccess.Set(0)
 		return ctx, err
@@ -427,11 +428,18 @@ func run(newCfg *Config, start bool) (Context, error) {
 		return ctx, nil
 	}
 
+	started := make([]string, 0, len(ctx.cfg.apps))
 	defer func() {
-		// if newCfg fails to start completely, clean up the already provisioned modules
-		// partially copied from provisionContext
 		if err != nil {
 			globalMetrics.configSuccess.Set(0)
+			// Even a failed Start can have begun serving requests. Stop all apps
+			// we attempted to start before retiring their module context, so they
+			// can hold cleanup until their asynchronous shutdowns have finished.
+			for _, name := range slices.Backward(started) {
+				if stopErr := ctx.cfg.apps[name].Stop(); stopErr != nil {
+					err = errors.Join(err, fmt.Errorf("aborting app %s: %w", name, stopErr))
+				}
+			}
 			ctx.cfg.cancelFunc(fmt.Errorf("configuration start error: %w", err))
 
 			if currentCtx.cfg != nil {
@@ -442,22 +450,11 @@ func run(newCfg *Config, start bool) (Context, error) {
 
 	// Start
 	err = func() error {
-		started := make([]string, 0, len(ctx.cfg.apps))
 		for name, a := range ctx.cfg.apps {
-			err := a.Start()
-			if err != nil {
-				// an app failed to start, so we need to stop
-				// all other apps that were already started
-				for _, otherAppName := range started {
-					err2 := ctx.cfg.apps[otherAppName].Stop()
-					if err2 != nil {
-						err = fmt.Errorf("%v; additionally, aborting app %s: %v",
-							err, otherAppName, err2)
-					}
-				}
-				return fmt.Errorf("%s app module: start: %v", name, err)
-			}
 			started = append(started, name)
+			if err := a.Start(); err != nil {
+				return fmt.Errorf("%s app module: start: %w", name, err)
+			}
 		}
 		return nil
 	}()
@@ -775,10 +772,26 @@ func exitProcess(ctx context.Context, logger *zap.Logger) {
 	lastContext := ActiveContext()
 
 	// stop all apps
-	if err := Stop(); err != nil {
-		logger.Error("failed to stop apps", zap.Error(err))
+	stopErr := Stop()
+	// Module cleanup can close the configured writers. Refresh the process
+	// logger after stopping and again after draining held configurations.
+	logger = Log().Named(logger.Name())
+	if stopErr != nil {
+		logger.Error("failed to stop apps", zap.Error(stopErr))
 		exitCode = ExitCodeFailedQuit
 	}
+
+	// Retired configurations can still own modules while their requests drain.
+	// Wait for cleanup before exit, but a forgotten hold must not keep the
+	// process alive indefinitely. A caller's shorter deadline is respected.
+	cleanupCtx, cancelCleanup := context.WithTimeout(ctx, 30*time.Second)
+	cleanupErr := waitForCleanup(cleanupCtx)
+	logger = Log().Named(logger.Name())
+	if err := cleanupErr; err != nil {
+		logger.Error("waiting for retired configuration cleanup", zap.Error(err))
+		exitCode = ExitCodeFailedQuit
+	}
+	cancelCleanup()
 
 	// clean up certmagic locks
 	certmagic.CleanUpOwnLocks(ctx, logger)
