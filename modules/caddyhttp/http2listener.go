@@ -22,12 +22,17 @@ type connectionStater interface {
 // 2. After wrapping the connection doesn't implement connectionStater, emit a warning so that listener
 // wrapper authors will hopefully implement it.
 // 3. check if the connection matches a specific http version. h2/h2c has a distinct preface.
+type http2ListenerLogger interface {
+	Debug(string, ...zap.Field)
+	Warn(string, ...zap.Field)
+}
+
 type http2Listener struct {
 	useTLS bool
 	useH1  bool
 	useH2  bool
 	net.Listener
-	logger *zap.Logger
+	logger http2ListenerLogger
 }
 
 func (h *http2Listener) Accept() (net.Conn, error) {
@@ -97,7 +102,7 @@ type http2Conn struct {
 	// whether the connection is expected to be h2/h2c
 	h2Expected bool
 	// log if one such connection is detected
-	logger *zap.Logger
+	logger http2ListenerLogger
 	net.Conn
 }
 

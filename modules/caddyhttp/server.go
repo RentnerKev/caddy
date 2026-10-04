@@ -394,10 +394,9 @@ type Server struct {
 	requests       sync.WaitGroup
 	requestsClosed bool
 
-	serveLoops      sync.WaitGroup
-	acceptedMu      sync.Mutex
-	acceptedFirst   map[net.Conn]time.Time
-	acceptedChanged chan struct{}
+	serveLoops          sync.WaitGroup
+	acceptedConnections acceptedConnectionTracker
+	transport           *sharedHTTPTransport
 
 	// precomputed underscore header allowlist (built during provisioning)
 	underscoreExactAllow  map[string]struct{}
@@ -566,18 +565,29 @@ var (
 	serverHeader = []string{ServerHeader}
 )
 
+func (s *Server) beginRequest() bool {
+	s.requestMu.Lock()
+	defer s.requestMu.Unlock()
+	if s.requestsClosed {
+		return false
+	}
+	s.requests.Add(1)
+	return true
+}
+
 // ServeHTTP is the entry point for all HTTP requests.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.requestMu.Lock()
-	if s.requestsClosed {
-		s.requestMu.Unlock()
+	if !s.beginRequest() {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	s.requests.Add(1)
-	s.requestMu.Unlock()
-	// Registered first so logging and all other handler defers finish first.
 	defer s.requests.Done()
+	s.serveAdmittedHTTP(w, r)
+}
+
+// serveAdmittedHTTP requires admission through beginRequest. Shared transports select
+// and admit a generation under the same lock that removes retired generations.
+func (s *Server) serveAdmittedHTTP(w http.ResponseWriter, r *http.Request) {
 	s.admitAcceptedConnection(r)
 	start := time.Now()
 
@@ -1171,12 +1181,14 @@ func (s *Server) RegisterConnContext(f func(ctx context.Context, c net.Conn) con
 	s.connContextFuncs = append(s.connContextFuncs, f)
 }
 
-// RegisterOnShutdown registers f to be invoked when the server begins to shut down.
+// RegisterOnShutdown registers f to be invoked when this server configuration
+// begins to retire, including when a compatible transport remains running.
 func (s *Server) RegisterOnShutdown(f func()) {
 	s.onShutdownFuncs = append(s.onShutdownFuncs, f)
 }
 
-// RegisterOnStop registers f to be invoked after the server has shut down completely.
+// RegisterOnStop registers f to be invoked after this server configuration
+// finishes draining. A compatible transport may still serve its replacement.
 //
 // EXPERIMENTAL: Subject to change or removal.
 func (s *Server) RegisterOnStop(f func(context.Context) error) {

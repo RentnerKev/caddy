@@ -139,6 +139,9 @@ type App struct {
 	// be given the full length of time to become idle and close.
 	// Once the grace period is over, connections will be forcefully closed.
 	// If zero, the grace period is eternal. Default: 0.
+	// Compatible plaintext TCP servers with an eternal grace period and no
+	// shutdown delay retain their transport across configuration reloads.
+	// Retired handlers drain while new requests use the replacement routes.
 	// Hijacked connections, such as HTTP/1 WebSockets, are managed separately
 	// by their handlers. In reverse_proxy, stream_close_delay can extend their
 	// lifetime beyond the grace period.
@@ -545,10 +548,25 @@ func (app *App) Start() error {
 			http2.ConfigureServer(srv.server, new(http2.Server))
 		}
 
+		if key, ok := sharedTransportKey(app, srv); ok {
+			var reused bool
+			srv.transport, reused = acquireSharedHTTPTransport(key, srv, srv.server, app.logger.Named("stdlib"))
+			srv.server = srv.transport.server
+			if reused {
+				srv.transport.mu.Lock()
+				srv.listeners = append([]net.Listener(nil), srv.transport.listeners...)
+				srv.addresses = append([]caddy.NetworkAddress(nil), srv.transport.addresses...)
+				srv.transport.mu.Unlock()
+				srv.logger.Info("server running", zap.String("name", srvName), zap.Strings("protocols", srv.Protocols))
+				continue
+			}
+		} else {
+			srv.configureServer(srv.server)
+		}
+
 		// this TLS config is used by the std lib to choose the actual TLS config for connections
 		// by looking through the connection policies to find the first one that matches
 		tlsCfg := srv.TLSConnPolicies.TLSConfig(app.ctx)
-		srv.configureServer(srv.server)
 
 		for lnIndex, lnAddr := range srv.Listen {
 			listenAddr, err := caddy.ParseNetworkAddress(lnAddr)
@@ -557,6 +575,11 @@ func (app *App) Start() error {
 			}
 
 			srv.addresses = append(srv.addresses, listenAddr)
+			if srv.transport != nil {
+				srv.transport.mu.Lock()
+				srv.transport.addresses = append(srv.transport.addresses, listenAddr)
+				srv.transport.mu.Unlock()
+			}
 
 			protocols := srv.Protocols
 			if srv.ListenProtocols != nil && srv.ListenProtocols[lnIndex] != nil {
@@ -616,13 +639,17 @@ func (app *App) Start() error {
 						ln = srv.listenerWrappers[i].WrapListener(ln)
 					}
 
+					var protocolLogger http2ListenerLogger = app.logger
+					if srv.transport != nil {
+						protocolLogger = srv.transport.logger
+					}
 					// check if the connection is h2c
 					ln = &http2Listener{
 						useTLS:   useTLS,
 						useH1:    h1ok,
 						useH2:    h2ok || h2cok,
 						Listener: ln,
-						logger:   app.logger,
+						logger:   protocolLogger,
 					}
 
 					// if binding to port 0, the OS chooses a port for us;
@@ -642,10 +669,20 @@ func (app *App) Start() error {
 					// already accepted can enter their first handler.
 					ln = &shutdownListener{Listener: ln}
 					srv.listeners = append(srv.listeners, ln)
-					srv.serveLoops.Go(func() {
-						//nolint:errcheck
-						srv.server.Serve(ln)
-					})
+					if transport := srv.transport; transport != nil {
+						transport.mu.Lock()
+						transport.listeners = append(transport.listeners, ln)
+						transport.mu.Unlock()
+						transport.serveLoops.Go(func() {
+							//nolint:errcheck
+							transport.server.Serve(ln)
+						})
+					} else {
+						srv.serveLoops.Go(func() {
+							//nolint:errcheck
+							srv.server.Serve(ln)
+						})
+					}
 				}
 
 				if h2ok && !useTLS {
@@ -836,6 +873,14 @@ func (app *App) beginShutdown() {
 	stopServer := func(server *Server) {
 		defer finishedShutdown.Done()
 
+		if server.transport != nil && server.transport.retire(server) {
+			// Another generation owns the compatible transport. Keep all of its
+			// connections open while this generation drains its admitted work.
+			server.transport.beginGenerationShutdown(server)
+			startedShutdown.Done()
+			return
+		}
+
 		// A manually constructed server may have no Caddy-owned listeners.
 		for _, listener := range server.listeners {
 			if err := listener.Close(); err != nil {
@@ -846,8 +891,14 @@ func (app *App) beginShutdown() {
 		if server.server == nil {
 			return
 		}
-		server.serveLoops.Wait()
-		server.awaitAcceptedRequests(ctx)
+		if server.transport != nil {
+			server.transport.serveLoops.Wait()
+			server.transport.accepted.await(ctx, time.Duration(server.ReadHeaderTimeout))
+			server.transport.beginGenerationShutdown(server)
+		} else {
+			server.serveLoops.Wait()
+			server.awaitAcceptedRequests(ctx)
+		}
 
 		if err := server.server.Shutdown(ctx); err != nil {
 			if closeErr := server.server.Close(); closeErr != nil {
@@ -859,6 +910,12 @@ func (app *App) beginShutdown() {
 			app.logger.Error("server shutdown",
 				zap.Error(err),
 				zap.Strings("addresses", server.Listen))
+		}
+		if server.transport != nil {
+			// net/http logs recovered panics after the handler returns. Keep its
+			// logging owner until connection goroutines have also finished.
+			server.transport.waitConnections()
+			server.transport.seal()
 		}
 	}
 	stopH3Server := func(server *Server) {
@@ -912,6 +969,9 @@ func (app *App) beginShutdown() {
 		finishedShutdown.Wait()
 		cancel()
 		for _, server := range app.Servers {
+			if server.transport != nil {
+				server.transport.waitGenerationShutdown(server)
+			}
 			server.finishRequests()
 		}
 
@@ -927,6 +987,11 @@ func (app *App) beginShutdown() {
 		}
 		if err := app.Metrics.shutdown(hookCtx); err != nil {
 			app.logger.Error("shutting down OTLP metrics", zap.Error(err))
+		}
+		for _, server := range app.Servers {
+			if server.transport != nil {
+				server.transport.releaseGeneration(server)
+			}
 		}
 		releaseCleanup()
 		close(app.shutdownDone)

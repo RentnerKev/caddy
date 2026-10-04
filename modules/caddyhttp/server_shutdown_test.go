@@ -121,18 +121,18 @@ func TestAcceptedConnectionWaitsForHandlerAdmission(t *testing.T) {
 	server := new(Server)
 	server.trackAcceptedConnection(conn, http.StateNew)
 	server.trackAcceptedConnection(conn, http.StateActive)
-	if len(server.acceptedFirst) != 1 {
+	if len(server.acceptedConnections.first) != 1 {
 		t.Fatal("StateActive prematurely admitted a connection")
 	}
 	request := httptest.NewRequest("GET", "/", nil).WithContext(context.WithValue(context.Background(), acceptedConnContextKey{}, conn))
 	server.admitAcceptedConnection(request)
-	if len(server.acceptedFirst) != 0 {
+	if len(server.acceptedConnections.first) != 0 {
 		t.Fatal("handler admission did not release first request wait")
 	}
 	for _, state := range []http.ConnState{http.StateIdle, http.StateClosed, http.StateHijacked} {
 		server.trackAcceptedConnection(conn, http.StateNew)
 		server.trackAcceptedConnection(conn, state)
-		if len(server.acceptedFirst) != 0 {
+		if len(server.acceptedConnections.first) != 0 {
 			t.Fatalf("state %s did not release first request wait", state)
 		}
 	}
