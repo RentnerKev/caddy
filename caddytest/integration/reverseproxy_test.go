@@ -2,6 +2,8 @@ package integration
 
 import (
 	"bufio"
+	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2/caddytest"
 )
@@ -826,6 +829,8 @@ func TestReverseProxySNIPlaceHolder(t *testing.T) {
 	for _, versions := range []string{"1.1 2", "3"} {
 		tester := caddytest.NewTester(t)
 		tester.InitServer(fmt.Sprintf(configTemplate, versions), "caddyfile")
+		// Config loading does not wait for asynchronous certificate issuance.
+		awaitSNITestCertificates(t)
 		req, err := http.NewRequest("GET", "https://localhost:9443", nil)
 		if err != nil {
 			t.Errorf("failed to create request %s", err)
@@ -834,6 +839,42 @@ func TestReverseProxySNIPlaceHolder(t *testing.T) {
 
 		req.Header.Set("X-SNI", "example.com")
 		tester.AssertResponse(req, 200, "example.com")
+	}
+}
+
+// awaitSNITestCertificates waits for the fixture's two internal certificates.
+// Only TLS readiness is retried; the proxy response is still asserted once.
+func awaitSNITestCertificates(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	for _, serverName := range []string{"localhost", "example.com"} {
+		dialer := &tls.Dialer{
+			NetDialer: &net.Dialer{Timeout: 250 * time.Millisecond},
+			Config: &tls.Config{
+				ServerName: serverName,
+				// The fixture uses an internal CA without installing its root.
+				InsecureSkipVerify: true,
+			},
+		}
+		for {
+			conn, err := dialer.DialContext(ctx, "tcp", "127.0.0.1:9443")
+			if err == nil {
+				state := conn.(*tls.Conn).ConnectionState()
+				err = state.PeerCertificates[0].VerifyHostname(serverName)
+				conn.Close()
+				if err == nil {
+					break
+				}
+			}
+			timer := time.NewTimer(10 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				t.Fatalf("certificate for %s did not become ready: %v (last handshake: %v)", serverName, ctx.Err(), err)
+			case <-timer.C:
+			}
+		}
 	}
 }
 
