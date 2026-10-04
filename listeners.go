@@ -115,10 +115,12 @@ func (na NetworkAddress) ListenAll(ctx context.Context, config net.ListenConfig)
 // Caddy's listeners can overlap each other: multiple listeners may be created on
 // the same socket at the same time. This is useful because during config changes,
 // the new config is started while the old config is still running. How this is
-// accomplished varies by platform and network type. For example, on Unix, SO_REUSEPORT
-// is set except on Unix sockets, for which the file descriptor is duplicated and
-// reused; on Windows, the close logic is virtualized using timeouts. Like normal
-// listeners, be sure to Close() them when you are done.
+// accomplished varies by platform and network type. Fixed-port TCP listeners
+// share a socket and virtualize Close using timeouts. On Unix, this sharing
+// requires no custom Control callback and matching Multipath TCP settings;
+// other TCP listeners and datagrams retain separate SO_REUSEPORT binds, and
+// Unix sockets duplicate their file descriptor. Like normal listeners, be sure
+// to Close() them when you are done.
 //
 // This method returns any type, as the implementations of listeners for various
 // network types are not interchangeable. The type of listener returned is switched

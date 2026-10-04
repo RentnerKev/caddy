@@ -106,6 +106,7 @@ func reuseUnixSocket(network, addr string) (any, error) {
 
 // listenReusable creates a new listener for the given network and address, and adds it to listenerPool.
 func listenReusable(ctx context.Context, lnKey string, network, address string, config net.ListenConfig) (any, error) {
+	useSharedTCP := (network == "tcp" || network == "tcp4" || network == "tcp6") && config.Control == nil
 	// even though SO_REUSEPORT lets us bind the socket multiple times,
 	// we still put it in the listenerPool so we can count how many
 	// configs are using this socket; necessary to ensure we can know
@@ -156,6 +157,17 @@ func listenReusable(ctx context.Context, lnKey string, network, address string, 
 		}
 	}
 
+	if useSharedTCP {
+		_, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		// Port zero asks for a new ephemeral socket. Default fixed TCP ports share one
+		// actual listener so retiring a generation cannot destroy its accept queue.
+		if port != "0" {
+			return listenReusableSharedStream(ctx, lnKey, network, address, config, nil, sharedTCPListenerPool, true)
+		}
+	}
 	datagram := slices.Contains([]string{"udp", "udp4", "udp6", "unixgram", "fdgram"}, network)
 	if datagram {
 		if fd {
