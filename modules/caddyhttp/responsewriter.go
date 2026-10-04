@@ -341,31 +341,84 @@ func (hc *hijackedConn) ReadFrom(r io.Reader) (int64, error) {
 	return n, err
 }
 
-// DetachResponseWriterAfterHijack configures w and its wrapped response
-// writers to detach when hijacked. It returns true if at least one writer
-// supports detachment and all such writers accept it. When detached,
-// bytes read or written stats will not be recorded for the hijacked
-// connection, and it's safe to use the connection after HTTP middleware returns.
+// nativeResponseWriter marks the response writer supplied by net/http itself.
+// Only the actual transport Handler entry point may install this marker, before
+// middleware wraps the writer. A native hijacked connection does not retain
+// middleware state and can safely outlive the handler.
+// Embedding by value keeps this wrapper to a single small allocation.
+type nativeResponseWriter struct {
+	ResponseWriterWrapper
+}
+
+func wrapNativeResponseWriter(w http.ResponseWriter) http.ResponseWriter {
+	if w == nil {
+		return nil
+	}
+	return &nativeResponseWriter{ResponseWriterWrapper{ResponseWriter: w}}
+}
+
+func (w *nativeResponseWriter) DetachAfterHijack(bool) bool {
+	return w != nil && w.ResponseWriter != nil
+}
+
+// The marker is installed only for native HTTP/1 writers. Preserve their direct
+// capabilities as well as Unwrap for middleware using type assertions instead
+// of ResponseController.
+func (w *nativeResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	//nolint:bodyclose
+	return http.NewResponseController(w.ResponseWriter).Hijack()
+}
+
+func (w *nativeResponseWriter) Flush() {
+	_ = w.FlushError()
+}
+
+func (w *nativeResponseWriter) FlushError() error {
+	//nolint:bodyclose
+	return http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+// CloseNotify preserves the legacy HTTP/1 capability without making writers
+// which lack it produce a spurious client-disconnect notification.
+func (w *nativeResponseWriter) CloseNotify() <-chan bool {
+	if notifier, ok := w.ResponseWriter.(interface{ CloseNotify() <-chan bool }); ok {
+		return notifier.CloseNotify()
+	}
+	return nil
+}
+
+// DetachResponseWriterAfterHijack configures w and its wrapped response writers
+// to detach when hijacked. Every explicit detachment implementation must accept
+// the change. Transparent writers must expose their underlying writer through
+// Unwrap; an opaque terminal must itself implement DetachAfterHijack and accept
+// the change, or be the native writer marked at the transport entry point.
+// Acceptance by an outer recorder cannot establish that an opaque inner writer
+// is safe. Cyclic or excessively deep wrapper chains are rejected.
+// When detached, bytes read or written stats will not be recorded for the
+// hijacked connection, and it is safe to use it after HTTP middleware returns.
 func DetachResponseWriterAfterHijack(w http.ResponseWriter, detached bool) bool {
-	found := false
-	for w != nil {
+	// Avoid comparing writer interfaces: a writer's dynamic value may contain
+	// a slice or map and thus be non-comparable. Bounding traversal also handles
+	// cycles involving more than one writer without allocations for a seen set.
+	const maxDepth = 256
+	for depth := 0; w != nil && depth < maxDepth; depth++ {
+		accepted := false
 		if detacher, ok := w.(interface{ DetachAfterHijack(bool) bool }); ok {
 			if !detacher.DetachAfterHijack(detached) {
 				return false
 			}
-			found = true
+			accepted = true
+		}
+		if _, native := w.(*nativeResponseWriter); native {
+			return accepted
 		}
 		unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
 		if !ok {
-			return found
+			return accepted
 		}
-		next := unwrapper.Unwrap()
-		if next == w {
-			return found
-		}
-		w = next
+		w = unwrapper.Unwrap()
 	}
-	return found
+	return false
 }
 
 // ResponseRecorder is a http.ResponseWriter that records

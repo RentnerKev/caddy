@@ -36,8 +36,9 @@ var (
 )
 
 type tunnelShutdownObserver struct {
-	ID    string `json:"id"`
-	state *tunnelShutdownState
+	OpaqueRecorded bool   `json:"opaque_recorded,omitempty"`
+	ID             string `json:"id"`
+	state          *tunnelShutdownState
 }
 
 func (tunnelShutdownObserver) CaddyModule() caddy.ModuleInfo {
@@ -56,6 +57,9 @@ func (h *tunnelShutdownObserver) Provision(ctx caddy.Context) error {
 }
 
 func (h *tunnelShutdownObserver) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if h.OpaqueRecorded {
+		w = caddyhttp.NewResponseRecorder(opaqueUpgradeWriter{w}, nil, nil)
+	}
 	return next.ServeHTTP(w, r)
 }
 
@@ -223,6 +227,17 @@ func TestTunnelRetirementLateRegistrationAndDelay(t *testing.T) {
 // Detached streams must survive retirement when the new configuration retains
 // their upstream, then close once that upstream is actually removed.
 func TestDetachedWebsocketReloadRetainsUpstream(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		disableIdleWriter bool
+	}{{"default idle writer", false}, {"disabled idle writer", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			testDetachedWebsocketReloadRetainsUpstream(t, tc.disableIdleWriter)
+		})
+	}
+}
+
+func testDetachedWebsocketReloadRetainsUpstream(t *testing.T, disableIdleWriter bool) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, _, err := http.NewResponseController(w).Hijack()
 		if err != nil {
@@ -241,13 +256,30 @@ func TestDetachedWebsocketReloadRetainsUpstream(t *testing.T) {
 		io.Copy(io.Discard, conn)
 	}))
 	defer backend.Close()
+	configuration := func(id string) []byte {
+		raw := tunnelShutdownConfig(id, backend.URL, 20*time.Millisecond, 0, true)
+		if !disableIdleWriter {
+			return raw
+		}
+		var config map[string]any
+		if err := json.Unmarshal(raw, &config); err != nil {
+			t.Fatal(err)
+		}
+		server := config["apps"].(map[string]any)["http"].(map[string]any)["servers"].(map[string]any)["test"].(map[string]any)
+		server["write_idle_timeout"] = -1
+		raw, err := json.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
 	id, state := newTunnelShutdownState(t)
-	if err := caddy.Load(tunnelShutdownConfig(id, backend.URL, 20*time.Millisecond, 0, true), true); err != nil {
+	if err := caddy.Load(configuration(id), true); err != nil {
 		t.Fatal(err)
 	}
 	conn, reader := openShutdownTunnel(t, awaitTunnelShutdown(t, state.addr))
 	nextID, next := newTunnelShutdownState(t)
-	if err := caddy.Load(tunnelShutdownConfig(nextID, backend.URL, 20*time.Millisecond, 0, true), true); err != nil {
+	if err := caddy.Load(configuration(nextID), true); err != nil {
 		t.Fatal(err)
 	}
 	awaitTunnelShutdown(t, next.addr)
@@ -279,6 +311,57 @@ func TestDetachedWebsocketReloadRetainsUpstream(t *testing.T) {
 	if _, err := reader.ReadByte(); err != io.EOF {
 		t.Fatalf("removed upstream stream remained open: %v", err)
 	}
+}
+
+func TestDetachedWebsocketReloadRejectsOpaqueRecorder(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		fmt.Fprint(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+		io.Copy(io.Discard, conn)
+	}))
+	defer backend.Close()
+	configuration := func(id string) []byte {
+		var config map[string]any
+		if err := json.Unmarshal(tunnelShutdownConfig(id, backend.URL, 20*time.Millisecond, 0, true), &config); err != nil {
+			t.Fatal(err)
+		}
+		server := config["apps"].(map[string]any)["http"].(map[string]any)["servers"].(map[string]any)["test"].(map[string]any)
+		observer := server["routes"].([]any)[0].(map[string]any)["handle"].([]any)[0].(map[string]any)
+		observer["opaque_recorded"] = true
+		raw, err := json.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	id, state := newTunnelShutdownState(t)
+	if err := caddy.Load(configuration(id), true); err != nil {
+		t.Fatal(err)
+	}
+	_, reader := openShutdownTunnel(t, awaitTunnelShutdown(t, state.addr))
+	nextID, next := newTunnelShutdownState(t)
+	// Retain the upstream: only a stream which stayed attached should close.
+	if err := caddy.Load(configuration(nextID), true); err != nil {
+		t.Fatal(err)
+	}
+	awaitTunnelShutdown(t, next.addr)
+	closeFrame := make([]byte, 4)
+	n, err := io.ReadFull(reader, closeFrame)
+	if err != nil && err != io.EOF {
+		t.Fatal(err)
+	}
+	if n != 0 && string(closeFrame) != string([]byte{0x88, 2, 3, 0xe9}) {
+		t.Fatalf("unexpected close frame %x", closeFrame)
+	}
+	if _, err := reader.ReadByte(); err != io.EOF {
+		t.Fatalf("opaque recorded stream was incorrectly detached: %v", err)
+	}
+	awaitTunnelShutdown(t, state.cleaned)
 }
 
 func TestTunnelCleanupJoinsActiveClosure(t *testing.T) {

@@ -6,7 +6,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -270,7 +272,7 @@ func TestResponseRecorderNestedDetach(t *testing.T) {
 			name = "detached"
 		}
 		t.Run(name, func(t *testing.T) {
-			inner := NewResponseRecorder(newHijackRespWriter(), nil, nil)
+			inner := NewResponseRecorder(wrapNativeResponseWriter(newHijackRespWriter()), nil, nil)
 			// Include an intervening middleware wrapper in the recorder chain.
 			outer := NewResponseRecorder(&ResponseWriterWrapper{ResponseWriter: inner}, nil, nil)
 			outer.WriteHeader(http.StatusSwitchingProtocols)
@@ -305,5 +307,208 @@ func TestResponseRecorderNestedDetach(t *testing.T) {
 				t.Error("detach should fail after hijack")
 			}
 		})
+	}
+}
+
+// An explicit terminal may promise that its hijacked connection has no state
+// tied to the middleware invocation. Unknown opaque terminals cannot do so.
+type detachTerminalWriter struct {
+	http.ResponseWriter
+	accept bool
+}
+
+func (w detachTerminalWriter) DetachAfterHijack(bool) bool { return w.accept }
+
+type cyclicDetachWriter struct {
+	http.ResponseWriter
+	next http.ResponseWriter
+}
+
+func (w *cyclicDetachWriter) Unwrap() http.ResponseWriter { return w.next }
+
+// A value writer with a slice field reproduces the interface comparison panic
+// of comparing an Unwrap result against the writer itself.
+type nonComparableDetachWriter struct {
+	http.ResponseWriter
+	values []int
+}
+
+func (w nonComparableDetachWriter) Unwrap() http.ResponseWriter { return w }
+
+func TestDetachResponseWriterSafety(t *testing.T) {
+	terminal := newHijackRespWriter()
+	native := wrapNativeResponseWriter(terminal)
+	acceptedOuter := func(inner http.ResponseWriter) http.ResponseWriter { return NewResponseRecorder(inner, nil, nil) }
+	self := &cyclicDetachWriter{ResponseWriter: terminal}
+	self.next = self
+	first := &cyclicDetachWriter{ResponseWriter: terminal}
+	second := &cyclicDetachWriter{ResponseWriter: terminal, next: first}
+	first.next = second
+	deep := native
+	for range 256 {
+		deep = &ResponseWriterWrapper{ResponseWriter: deep}
+	}
+	for _, tc := range []struct {
+		name   string
+		writer http.ResponseWriter
+		want   bool
+	}{
+		{"nil", nil, false},
+		{"nil native", wrapNativeResponseWriter(nil), false},
+		{"typed nil native", (*nativeResponseWriter)(nil), false},
+		{"zero native", &nativeResponseWriter{}, false},
+		{"unknown terminal", terminal, false},
+		{"transparent unknown", &ResponseWriterWrapper{ResponseWriter: terminal}, false},
+		{"native terminal", native, true},
+		{"transparent native", &ResponseWriterWrapper{ResponseWriter: native}, true},
+		{"idle native", &IdleTimeoutWriter{ResponseWriterWrapper: &ResponseWriterWrapper{ResponseWriter: native}}, true},
+		{"accepted outer native", acceptedOuter(native), true},
+		{"opaque inner after accepted outer", acceptedOuter(terminal), false},
+		{"nil inner after accepted outer", acceptedOuter(nil), false},
+		{"explicit safe terminal", detachTerminalWriter{terminal, true}, true},
+		{"explicit rejecting terminal", acceptedOuter(detachTerminalWriter{terminal, false}), false},
+		{"explicit reject before native", acceptedOuter(detachTerminalWriter{native, false}), false},
+		{"self cycle", acceptedOuter(self), false},
+		{"two writer cycle", acceptedOuter(first), false},
+		{"non comparable cycle", acceptedOuter(nonComparableDetachWriter{terminal, []int{1}}), false},
+		{"excessive depth", deep, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DetachResponseWriterAfterHijack(tc.writer, true); got != tc.want {
+				t.Fatalf("detach=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNativeResponseWriterForwardsTransportOperations(t *testing.T) {
+	underlying := newHijackRespWriter()
+	wrapped := wrapNativeResponseWriter(underlying)
+	wrapped.Header().Set("X-Test", "forwarded")
+	if underlying.Header().Get("X-Test") != "forwarded" {
+		t.Fatal("header mutation not forwarded")
+	}
+	wrapped.WriteHeader(http.StatusSwitchingProtocols)
+	if underlying.status != http.StatusSwitchingProtocols {
+		t.Fatal("status not forwarded")
+	}
+	conn, _, err := http.NewResponseController(wrapped).Hijack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("detached")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeResponseWriterHTTP1Capabilities(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFlush := func() { releaseOnce.Do(func() { close(release) }) }
+	notifications := make(chan (<-chan bool), 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w = wrapNativeResponseWriter(w)
+		hijacker, hijackOK := w.(http.Hijacker)
+		flusher, flushOK := w.(http.Flusher)
+		readerFrom, readFromOK := w.(io.ReaderFrom)
+		// This structural assertion is the legacy http.CloseNotifier interface.
+		notifier, notifyOK := w.(interface{ CloseNotify() <-chan bool })
+		if !hijackOK || !flushOK || !readFromOK || !notifyOK {
+			t.Errorf("native H1 capabilities: hijack=%v flush=%v readerFrom=%v closeNotify=%v", hijackOK, flushOK, readFromOK, notifyOK)
+			http.Error(w, "missing H1 capabilities", 500)
+			return
+		}
+		if r.URL.Path == "/hijack" {
+			conn, brw, err := hijacker.Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer conn.Close()
+			if _, err := brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\nnative hijack"); err != nil {
+				t.Error(err)
+				return
+			}
+			if err := brw.Flush(); err != nil {
+				t.Error(err)
+			}
+			return
+		}
+		rc := http.NewResponseController(w)
+		deadline := time.Now().Add(5 * time.Second)
+		for _, err := range []error{rc.SetReadDeadline(deadline), rc.SetWriteDeadline(deadline), rc.SetReadDeadline(time.Time{}), rc.SetWriteDeadline(time.Time{}), rc.EnableFullDuplex()} {
+			if err != nil {
+				t.Error(err)
+				http.Error(w, "response controller failure", 500)
+				return
+			}
+		}
+		notifications <- notifier.CloseNotify()
+		n, err := readerFrom.ReadFrom(strings.NewReader("reader-from"))
+		if err != nil || n != 11 {
+			t.Errorf("ReadFrom()=%d,%v", n, err)
+			return
+		}
+		flusher.Flush()
+		// The client must receive bytes while this handler is still active, proving
+		// that the direct Flush capability reached the real transport.
+		<-release
+	}))
+	defer server.Close()
+	defer releaseFlush()
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
+	defer client.CloseIdleConnections()
+	response, err := client.Get(server.URL + "/flush")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.ProtoMajor != 1 || response.StatusCode != 200 {
+		t.Fatalf("response=%s %d", response.Proto, response.StatusCode)
+	}
+	payload := make([]byte, 11)
+	if _, err := io.ReadFull(response.Body, payload); err != nil {
+		t.Fatal(err)
+	}
+	if string(payload) != "reader-from" {
+		t.Fatalf("unexpected payload %q", payload)
+	}
+	var disconnected <-chan bool
+	select {
+	case disconnected = <-notifications:
+	case <-time.After(5 * time.Second):
+		t.Fatal("missing CloseNotify channel")
+	}
+	response.Body.Close()
+	select {
+	case <-disconnected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("CloseNotify did not observe client disconnect")
+	}
+	releaseFlush()
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(server.URL, "http://"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(conn, "GET /hijack HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	upgrade, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upgrade.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("hijack status=%d", upgrade.StatusCode)
+	}
+	hijacked, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(hijacked) != "native hijack" {
+		t.Fatalf("hijacked payload=%q", hijacked)
 	}
 }

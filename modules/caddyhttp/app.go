@@ -495,9 +495,15 @@ func (app *App) Start() error {
 			WriteTimeout:      time.Duration(srv.WriteTimeout),
 			IdleTimeout:       time.Duration(srv.IdleTimeout),
 			MaxHeaderBytes:    srv.MaxHeaderBytes,
-			Handler:           srv,
-			ErrorLog:          serverLogger,
-			Protocols:         new(http.Protocols),
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Mark only the writer supplied by the transport, before middleware.
+				if r.ProtoMajor == 1 {
+					w = wrapNativeResponseWriter(w)
+				}
+				srv.ServeHTTP(w, r)
+			}),
+			ErrorLog:  serverLogger,
+			Protocols: new(http.Protocols),
 			ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 				if nc, ok := c.(interface{ tlsNetConn() net.Conn }); ok {
 					getTlsConStateFunc := sync.OnceValue(func() *tls.ConnectionState {

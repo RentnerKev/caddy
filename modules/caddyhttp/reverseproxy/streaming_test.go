@@ -51,7 +51,7 @@ func TestHandlerCopyResponse(t *testing.T) {
 
 func TestSwitchProtocolCopierBufferSize(t *testing.T) {
 	var wg sync.WaitGroup
-	var errc = make(chan error, 1)
+	errc := make(chan error, 1)
 	var dst bytes.Buffer
 	var sent, received int64
 
@@ -669,6 +669,9 @@ type pipeUpgradeWriter struct {
 func (w pipeUpgradeWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return w.conn, bufio.NewReadWriter(bufio.NewReader(w.conn), bufio.NewWriter(w.conn)), nil
 }
+
+// The fixture's bare pipe is a native connection, with no middleware state.
+func (pipeUpgradeWriter) DetachAfterHijack(bool) bool { return true }
 
 func TestUpgradeDetachmentRequiresWriterSupport(t *testing.T) {
 	for _, tc := range []struct {
