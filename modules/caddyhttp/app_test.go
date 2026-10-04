@@ -24,11 +24,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
-
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 func TestStopWaitsForPreviousConfiguration(t *testing.T) {
@@ -41,7 +41,7 @@ func TestStopWaitsForPreviousConfiguration(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				current := &App{logger: zap.NewNop()}
+				current := &App{stopOnce: new(sync.Once), logger: zap.NewNop()}
 				stopped := make(chan error, 1)
 				go func() { stopped <- current.stop(true) }()
 				select {
@@ -77,7 +77,7 @@ func TestStopPreviousConfigurationGracePeriod(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	current := &App{GracePeriod: caddy.Duration(50 * time.Millisecond), logger: zap.NewNop()}
+	current := &App{stopOnce: new(sync.Once), GracePeriod: caddy.Duration(50 * time.Millisecond), logger: zap.NewNop()}
 	stopped := make(chan error, 1)
 	start := time.Now()
 	go func() { stopped <- current.stop(true) }()
@@ -131,8 +131,9 @@ func appWithPendingResponse(t *testing.T, http2 bool) (*App, *http.Response, fun
 		t.Fatalf("expected HTTP/2, got %s", response.Proto)
 	}
 	app := &App{
-		Servers: map[string]*Server{"test": {server: server.Config}},
-		logger:  zap.NewNop(),
+		stopOnce: new(sync.Once),
+		Servers:  map[string]*Server{"test": {server: server.Config}},
+		logger:   zap.NewNop(),
 	}
 	t.Cleanup(func() {
 		release()

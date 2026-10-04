@@ -139,6 +139,9 @@ type App struct {
 	// be given the full length of time to become idle and close.
 	// Once the grace period is over, connections will be forcefully closed.
 	// If zero, the grace period is eternal. Default: 0.
+	// Hijacked connections, such as HTTP/1 WebSockets, are managed separately
+	// by their handlers. In reverse_proxy, stream_close_delay can extend their
+	// lifetime beyond the grace period.
 	GracePeriod caddy.Duration `json:"grace_period,omitempty"`
 
 	// ShutdownDelay is how long to wait before initiating the grace
@@ -167,10 +170,9 @@ type App struct {
 	logger *zap.Logger
 	tlsApp *caddytls.TLS
 
-	// stopped indicates whether the app has stopped
-	// It can only happen if it has started successfully in the first place.
-	// Otherwise, Cleanup will call Stop to clean up resources.
-	stopped bool
+	// Stop and Cleanup can both be called for partially started apps.
+	stopOnce     *sync.Once
+	shutdownDone chan struct{}
 
 	// used temporarily between phases 1 and 2 of auto HTTPS
 	allCertDomains map[string]struct{}
@@ -180,12 +182,17 @@ type App struct {
 func (App) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http",
-		New: func() caddy.Module { return new(App) },
+		New: func() caddy.Module { return &App{stopOnce: new(sync.Once)} },
 	}
 }
 
 // Provision sets up the app.
 func (app *App) Provision(ctx caddy.Context) error {
+	// Keep the shutdown lock behind a pointer so App remains safe to copy for
+	// module metadata and JSON configuration construction.
+	if app.stopOnce == nil {
+		app.stopOnce = new(sync.Once)
+	}
 	// store some references
 	app.logger = ctx.Logger()
 	app.ctx = ctx
@@ -625,10 +632,14 @@ func (app *App) Start() error {
 						zap.Bool("tls", useTLS),
 						zap.Bool("http3", srv.h3server != nil))
 
+					// Listener retirement precedes net/http's shutdown flag so sockets
+					// already accepted can enter their first handler.
+					ln = &shutdownListener{Listener: ln}
 					srv.listeners = append(srv.listeners, ln)
-
-					//nolint:errcheck
-					go srv.server.Serve(ln)
+					srv.serveLoops.Go(func() {
+						//nolint:errcheck
+						srv.server.Serve(ln)
+					})
 				}
 
 				if h2ok && !useTLS {
@@ -719,7 +730,57 @@ func (app *App) Stop() error {
 	return app.stop(caddy.Exiting())
 }
 
+// startShutdown reports whether this invocation initiated shutdown. Cleanup
+// needs that distinction when a configuration was never successfully started.
+func (app *App) startShutdown() bool {
+	initiated := false
+	app.stopOnce.Do(func() {
+		initiated = true
+		app.shutdownDone = make(chan struct{})
+		app.beginShutdown()
+	})
+	return initiated
+}
+
 func (app *App) stop(exiting bool) error {
+	app.startShutdown()
+	if exiting {
+		// Bound process exit without cleaning up resources still used by handlers.
+		budget := shutdownHookTimeout
+		if app.GracePeriod > 0 {
+			budget += time.Duration(app.GracePeriod)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
+		defer cancel()
+		select {
+		case <-app.shutdownDone:
+		case <-ctx.Done():
+			app.logger.Error("waiting for server shutdown", zap.Error(ctx.Err()))
+			return nil
+		}
+		// Earlier configurations may have an eternal grace period.
+		budget = shutdownHookTimeout
+		if app.GracePeriod > 0 {
+			budget = time.Duration(app.GracePeriod)
+		}
+		previousCtx, previousCancel := context.WithTimeout(context.Background(), budget)
+		defer previousCancel()
+		pendingServerShutdowns.Range(func(done, _ any) bool {
+			select {
+			case <-done.(chan struct{}):
+				return true
+			case <-previousCtx.Done():
+				app.logger.Error("waiting for previous server shutdowns", zap.Error(previousCtx.Err()))
+				return false
+			}
+		})
+	}
+	return nil
+}
+
+// beginShutdown launches a finalizer so reloads can return while responses drain.
+func (app *App) beginShutdown() {
+	releaseCleanup := app.ctx.HoldCleanup()
 	ctx := context.Background()
 
 	// see if any listeners in our config will be closing or if they are continuing
@@ -752,43 +813,40 @@ func (app *App) stop(exiting bool) error {
 
 	// enforce grace period if configured
 	var finishedShutdown sync.WaitGroup
+	var cancel context.CancelFunc = func() {}
 	if app.GracePeriod > 0 {
-		var cancel context.CancelFunc
 		timeout := time.Duration(app.GracePeriod)
-		ctx, cancel = context.WithTimeoutCause(ctx, timeout, fmt.Errorf("server graceful shutdown %ds timeout", int(timeout.Seconds())))
-		defer func() {
-			// A reload must leave the grace period alive while its requests finish.
-			go func() {
-				finishedShutdown.Wait()
-				cancel()
-			}()
-		}()
+		ctx, cancel = context.WithTimeoutCause(ctx, timeout, fmt.Errorf("server graceful shutdown %s timeout", timeout))
 		app.logger.Info("servers shutting down; grace period initiated", zap.Duration("duration", timeout))
 	} else {
 		app.logger.Info("servers shutting down with eternal grace period")
 	}
 
-	// goroutines aren't guaranteed to be scheduled right away,
-	// so we'll use one WaitGroup to wait for all the goroutines
-	// to start their server shutdowns, and another to wait for
-	// them to finish; we'll always block for them to start so
-	// that when we return the caller can be confident* that the
-	// old servers are no longer accepting new connections
-	// (* the scheduler might still pause them right before
-	// calling Shutdown(), but it's unlikely)
+	// Reloads wait for TCP listener retirement, but not for accepted sockets or
+	// active responses to drain. The HTTP/3 worker separately begins its drain.
 	var startedShutdown sync.WaitGroup
 
 	// these will run in goroutines
 	stopServer := func(server *Server) {
 		defer finishedShutdown.Done()
-		startedShutdown.Done()
 
-		// possible if server failed to Start
+		// A manually constructed server may have no Caddy-owned listeners.
+		for _, listener := range server.listeners {
+			if err := listener.Close(); err != nil {
+				app.logger.Error("server listener close", zap.Error(err))
+			}
+		}
+		startedShutdown.Done()
 		if server.server == nil {
 			return
 		}
+		server.serveLoops.Wait()
+		server.awaitAcceptedRequests(ctx)
 
 		if err := server.server.Shutdown(ctx); err != nil {
+			if closeErr := server.server.Close(); closeErr != nil {
+				app.logger.Error("server force close", zap.Error(closeErr))
+			}
 			if cause := context.Cause(ctx); cause != nil && errors.Is(err, context.DeadlineExceeded) {
 				err = cause
 			}
@@ -815,6 +873,9 @@ func (app *App) stop(exiting bool) error {
 		}
 
 		if err := server.h3server.Shutdown(ctx); err != nil {
+			if closeErr := server.h3server.Close(); closeErr != nil {
+				app.logger.Error("HTTP/3 server force close", zap.Error(closeErr))
+			}
 			if cause := context.Cause(ctx); cause != nil && errors.Is(err, context.DeadlineExceeded) {
 				err = cause
 			}
@@ -840,68 +901,45 @@ func (app *App) stop(exiting bool) error {
 		go stopH3Server(server)
 	}
 
-	shutdownDone := make(chan struct{})
-	pendingServerShutdowns.Store(shutdownDone, struct{}{})
+	pendingServerShutdowns.Store(app.shutdownDone, struct{}{})
 	go func() {
 		finishedShutdown.Wait()
-		close(shutdownDone)
-		pendingServerShutdowns.Delete(shutdownDone)
-	}()
+		cancel()
+		for _, server := range app.Servers {
+			server.finishRequests()
+		}
 
-	// block until all the goroutines have been run by the scheduler;
-	// this means that they have likely called Shutdown() by now
-	startedShutdown.Wait()
-
-	// if the process is exiting, we need to block here and wait
-	// for the grace periods to complete, otherwise the process will
-	// terminate before the servers are finished shutting down; but
-	// we don't really need to wait for the grace period to finish
-	// if the process isn't exiting (but note that frequent config
-	// reloads with long grace periods for a sustained length of time
-	// may deplete resources)
-	if exiting {
-		finishedShutdown.Wait()
-
-		// Responses from earlier configurations must finish before the process exits.
-		pendingServerShutdowns.Range(func(done, _ any) bool {
-			select {
-			case <-done.(chan struct{}):
-				return true
-			case <-ctx.Done():
-				app.logger.Error("waiting for previous server shutdowns", zap.Error(context.Cause(ctx)))
-				return false
-			}
-		})
-	}
-
-	// run stop callbacks now that the server shutdowns are complete
-	for name, s := range app.Servers {
-		for _, stopHook := range s.onStopFuncs {
-			if err := stopHook(ctx); err != nil {
-				app.logger.Error("server stop hook", zap.String("server", name), zap.Error(err))
+		// Grace may have expired. Hooks and metrics get a fresh finite context.
+		hookCtx, hookCancel := context.WithTimeout(context.Background(), shutdownHookTimeout)
+		defer hookCancel()
+		for name, server := range app.Servers {
+			for _, stopHook := range server.onStopFuncs {
+				if err := stopHook(hookCtx); err != nil {
+					app.logger.Error("server stop hook", zap.String("server", name), zap.Error(err))
+				}
 			}
 		}
-	}
+		if err := app.Metrics.shutdown(hookCtx); err != nil {
+			app.logger.Error("shutting down OTLP metrics", zap.Error(err))
+		}
+		releaseCleanup()
+		close(app.shutdownDone)
+		pendingServerShutdowns.Delete(app.shutdownDone)
+	}()
+	startedShutdown.Wait()
+}
 
-	// flush and shut down the OTLP metrics exporter (if configured) so any
-	// last data point reaches the collector before the process exits
-	if err := app.Metrics.shutdown(ctx); err != nil {
-		app.logger.Error("shutting down OTLP metrics", zap.Error(err))
+// Cleanup also finalizes validated or unsuccessfully provisioned apps, whose
+// context may already be retired and therefore unable to acquire a cleanup hold.
+// Only the initiating call waits; reentrant Cleanup from hold release must return.
+func (app *App) Cleanup() error {
+	if app.startShutdown() {
+		<-app.shutdownDone
 	}
-
-	app.stopped = true
 	return nil
 }
 
-// Cleanup will close remaining listeners if they still remain
-// because some of the servers fail to start.
-// It simply calls Stop because Stop won't be called when Start fails.
-func (app *App) Cleanup() error {
-	if app.stopped {
-		return nil
-	}
-	return app.Stop()
-}
+const shutdownHookTimeout = 30 * time.Second
 
 func (app *App) httpPort() int {
 	if app.HTTPPort == 0 {

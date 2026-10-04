@@ -305,6 +305,11 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.ctx = ctx
 	h.logger = ctx.Logger()
 	h.tunnelTracker = newTunnelTracker(h.logger, time.Duration(h.StreamCloseDelay))
+	if server, ok := ctx.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok {
+		server.RegisterOnShutdown(func() {
+			_ = h.tunnelTracker.stopAttachedConnections()
+		})
+	}
 	h.streamLogLevel = defaultStreamLogLevel
 	h.streamLogLoggerName = defaultStreamLoggerName
 	if h.StreamLogs != nil {

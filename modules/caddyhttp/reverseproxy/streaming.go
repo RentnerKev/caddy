@@ -213,7 +213,12 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 	repl.Set("http.reverse_proxy.upgraded", true)
 	streamUUID, _ := repl.GetString("http.request.uuid")
 	streamFields := makeStreamLogFields(streamUUID)
-	streamLogger := h.streamLoggerForRequest(req)
+	// Stream loggers come from the process logger, which can belong to a
+	// different configuration from this handler. Retain only the resolved
+	// name and select the current logger for each event, without retaining
+	// the handler, request, or a retired configuration's writer.
+	streamLoggerName := h.streamLoggerForRequest(req).Name()
+	streamLogger := func() *zap.Logger { return caddy.Log().Named(streamLoggerName) }
 	streamLevel := h.streamLogLevel
 	finishMetrics := trackActiveStream(upstreamAddr)
 
@@ -253,7 +258,7 @@ func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWrit
 
 // handleUpgradeTunnel returns when transfer is done.
 func handleUpgradeTunnel(
-	streamLogger *zap.Logger,
+	streamLogger func() *zap.Logger,
 	streamLevel zapcore.Level,
 	conn io.ReadWriteCloser,
 	backConn io.ReadWriteCloser,
@@ -326,14 +331,14 @@ copyLoop:
 		case err := <-errc:
 			if err != nil {
 				result = classifyStreamResult(err)
-				if c := streamLogger.Check(streamLevel, "streaming error"); c != nil && !errors.Is(err, errCopyDone) {
+				if c := streamLogger().Check(streamLevel, "streaming error"); c != nil && !errors.Is(err, errCopyDone) {
 					c.Write(zap.Error(err))
 				}
 				break copyLoop
 			}
 		case t := <-timeoutc:
 			result = "timeout"
-			if c := streamLogger.Check(streamLevel, "stream timed out"); c != nil {
+			if c := streamLogger().Check(streamLevel, "stream timed out"); c != nil {
 				c.Write(zap.Time("timeout", t))
 			}
 			break copyLoop
@@ -347,7 +352,7 @@ copyLoop:
 	wg.Wait()
 
 	finishMetrics(result, time.Since(start), toBackend, fromBackend)
-	if c := streamLogger.Check(streamLevel, "connection closed"); c != nil {
+	if c := streamLogger().Check(streamLevel, "connection closed"); c != nil {
 		fields := append([]zap.Field{}, streamFields...)
 		fields = append(fields,
 			zap.Duration("duration", time.Since(start)),
@@ -540,12 +545,15 @@ type openConnection struct {
 // Handler and config, since we typically want them to survive past config reloads.
 // It also allows for selective connection cleanup based on their attachment status.
 type tunnelTracker struct {
-	connections map[io.ReadWriteCloser]openConnection
-	closeTimer  *time.Timer
-	closeDelay  time.Duration
-	stopped     bool
-	mu          sync.Mutex
-	logger      *zap.Logger
+	connections     map[io.ReadWriteCloser]openConnection
+	closeTimer      *time.Timer
+	closeDelay      time.Duration
+	stopped         bool
+	attachedClosed  bool
+	cleanupComplete bool
+	closingDone     chan struct{}
+	mu              sync.Mutex
+	logger          *zap.Logger
 }
 
 func newTunnelTracker(logger *zap.Logger, closeDelay time.Duration) *tunnelTracker {
@@ -560,17 +568,24 @@ func newTunnelTracker(logger *zap.Logger, closeDelay time.Duration) *tunnelTrack
 // the returned del func when the connection is done.
 func (ts *tunnelTracker) registerConnection(conn io.ReadWriteCloser, gracefulClose func() error, detached bool, upstream string) (del func()) {
 	ts.mu.Lock()
-	ts.connections[conn] = openConnection{conn, gracefulClose, detached, upstream}
+	oc := openConnection{conn, gracefulClose, detached, upstream}
+	closeNow := ts.attachedClosed && !detached
+	if !closeNow {
+		ts.connections[conn] = oc
+	}
 	ts.mu.Unlock()
+	// A request admitted during retirement must not reopen an attached tunnel
+	// after the retirement timer has already closed the existing tunnels.
+	if closeNow {
+		_ = closeTunnelConnection(oc)
+	}
 	return func() {
 		ts.mu.Lock()
 		delete(ts.connections, conn)
-		empty := len(ts.connections) == 0 && ts.stopped
+		empty := len(ts.connections) == 0 && ts.cleanupComplete
 		if empty {
 			if ts.closeTimer != nil {
-				if ts.closeTimer.Stop() {
-					ts.logger.Debug("stopped streaming connections close timer - all connections are already closed")
-				}
+				ts.closeTimer.Stop()
 				ts.closeTimer = nil
 			}
 		}
@@ -581,62 +596,106 @@ func (ts *tunnelTracker) registerConnection(conn io.ReadWriteCloser, gracefulClo
 	}
 }
 
-// closeAttachedConnections closes all tracked attached connections.
-func (ts *tunnelTracker) closeAttachedConnections() error {
+// closeTunnelConnection performs best-effort graceful closure followed by closure.
+func closeTunnelConnection(oc openConnection) error {
 	var err error
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	for _, oc := range ts.connections {
-		// detached connections are only closed when the upstream is gone from the config
-		if oc.detached {
-			continue
+	if oc.gracefulClose != nil {
+		err = oc.gracefulClose()
+		if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+			err = nil
 		}
-		if oc.gracefulClose != nil {
-			if gracefulErr := oc.gracefulClose(); gracefulErr != nil && err == nil {
-				err = gracefulErr
-			}
-		}
-		if closeErr := oc.conn.Close(); closeErr != nil && err == nil {
-			err = closeErr
-		}
+	}
+	closeErr := oc.conn.Close()
+	if errors.Is(closeErr, net.ErrClosed) || errors.Is(closeErr, io.ErrClosedPipe) {
+		closeErr = nil
+	}
+	if err == nil {
+		err = closeErr
 	}
 	return err
 }
 
-// cleanupAttachedConnections closes upgraded attached connections.
-// Depending on closeDelay it does that either immediately or after a timer.
-func (ts *tunnelTracker) cleanupAttachedConnections() error {
+// closeAttachedConnections closes all tracked attached connections. Marking the
+// tracker closed under the registration lock also covers later admissions.
+func (ts *tunnelTracker) closeAttachedConnections() error {
 	ts.mu.Lock()
-	// Mark the tracker stopped before upstream-removal notifications, even
-	// when attached connections will be closed after a delay.
-	ts.stopped = true
-	if len(ts.connections) == 0 {
+	if ts.attachedClosed {
 		ts.mu.Unlock()
-		unregisterDetachedTunnelTrackers(ts)
 		return nil
 	}
+	ts.attachedClosed = true
+	ts.closingDone = make(chan struct{})
+	done := ts.closingDone
+	logErrors := !ts.cleanupComplete
+	var connections []openConnection
+	for _, oc := range ts.connections {
+		if !oc.detached {
+			connections = append(connections, oc)
+		}
+	}
+	ts.mu.Unlock()
+	defer close(done)
+	var err error
+	for _, oc := range connections {
+		if closeErr := closeTunnelConnection(oc); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+	if err != nil && logErrors {
+		ts.logger.Error("closing attached streaming connections", zap.Error(err))
+	}
+	return err
+}
+
+// stopAttachedConnections starts retirement before HTTP shutdown waits for
+// attached tunnel handlers. Cleanup alone is too late: those handlers cannot
+// return until their hijacked connections close. The delay starts only once.
+func (ts *tunnelTracker) stopAttachedConnections() error {
+	ts.mu.Lock()
+	if ts.stopped {
+		ts.mu.Unlock()
+		return nil
+	}
+	ts.stopped = true
 	if ts.closeDelay == 0 {
 		ts.mu.Unlock()
 		return ts.closeAttachedConnections()
 	}
-
-	defer ts.mu.Unlock()
 	delay := ts.closeDelay
 	ts.closeTimer = time.AfterFunc(delay, func() {
-		if c := ts.logger.Check(zapcore.DebugLevel, "closing streaming connections after delay"); c != nil {
-			c.Write(zap.Duration("delay", delay))
-		}
-		err := ts.closeAttachedConnections()
-		if err != nil {
-			if c := ts.logger.Check(zapcore.ErrorLevel, "failed to close connections after delay"); c != nil {
-				c.Write(
-					zap.Error(err),
-					zap.Duration("delay", delay),
-				)
-			}
-		}
+		_ = ts.closeAttachedConnections()
 	})
+	ts.mu.Unlock()
 	return nil
+}
+
+// cleanupAttachedConnections also handles handlers without a running server.
+// Keep an empty retiring tracker registered until cleanup: requests already
+// admitted by the server may still register detached tunnels during retirement.
+func (ts *tunnelTracker) cleanupAttachedConnections() error {
+	err := ts.stopAttachedConnections()
+	ts.mu.Lock()
+	ts.cleanupComplete = true
+	empty := len(ts.connections) == 0
+	if empty {
+		ts.attachedClosed = true
+		if ts.closeTimer != nil {
+			ts.closeTimer.Stop()
+			ts.closeTimer = nil
+		}
+	}
+	// A closure already in progress may still be using the handler logger.
+	// Join it before module resources disappear. A future delayed closure is
+	// connection-only and deliberately does not use the retired logger.
+	done := ts.closingDone
+	ts.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+	if empty {
+		unregisterDetachedTunnelTrackers(ts)
+	}
+	return err
 }
 
 // writeCloseControl sends a best-effort Close control message to the given

@@ -28,6 +28,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -388,6 +389,16 @@ type Server struct {
 
 	shutdownAt atomic.Pointer[time.Time]
 
+	// Protect handler admission against late dispatch after transport Close.
+	requestMu      sync.Mutex
+	requests       sync.WaitGroup
+	requestsClosed bool
+
+	serveLoops      sync.WaitGroup
+	acceptedMu      sync.Mutex
+	acceptedFirst   map[net.Conn]time.Time
+	acceptedChanged chan struct{}
+
 	// precomputed underscore header allowlist (built during provisioning)
 	underscoreExactAllow  map[string]struct{}
 	underscoreExactDrop   map[string]struct{}
@@ -403,6 +414,14 @@ type Server struct {
 	connContextFuncs []func(ctx context.Context, c net.Conn) context.Context
 	onShutdownFuncs  []func()
 	onStopFuncs      []func(context.Context) error // TODO: Experimental (Nov. 2023)
+}
+
+// finishRequests seals admission before waiting, avoiding Add racing with Wait.
+func (s *Server) finishRequests() {
+	s.requestMu.Lock()
+	s.requestsClosed = true
+	s.requestMu.Unlock()
+	s.requests.Wait()
 }
 
 // aliasPrefixRule pairs a canonical allowed prefix (underscore- or
@@ -549,6 +568,17 @@ var (
 
 // ServeHTTP is the entry point for all HTTP requests.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.requestMu.Lock()
+	if s.requestsClosed {
+		s.requestMu.Unlock()
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	s.requests.Add(1)
+	s.requestMu.Unlock()
+	// Registered first so logging and all other handler defers finish first.
+	defer s.requests.Done()
+	s.admitAcceptedConnection(r)
 	start := time.Now()
 
 	// If there are listener wrappers that process tls connections but don't return a *tls.Conn, this field will be nil.
@@ -1086,6 +1116,14 @@ func (s *Server) serveHTTP3(addr caddy.NetworkAddress, tlsCfg *tls.Config) error
 
 // configureServer applies/binds the registered callback functions to the server.
 func (s *Server) configureServer(server *http.Server) {
+	// Register acceptance before module hooks: a hook can delay conn.serve.
+	baseConnState := server.ConnState
+	server.ConnState = func(conn net.Conn, state http.ConnState) {
+		s.trackAcceptedConnection(conn, state)
+		if baseConnState != nil {
+			baseConnState(conn, state)
+		}
+	}
 	for _, f := range s.connStateFuncs {
 		if server.ConnState != nil {
 			baseConnStateFunc := server.ConnState
@@ -1107,6 +1145,15 @@ func (s *Server) configureServer(server *http.Server) {
 		} else {
 			server.ConnContext = f
 		}
+	}
+
+	// Keep the connection identity even if a module replaces its context.
+	baseConnContext := server.ConnContext
+	server.ConnContext = func(ctx context.Context, conn net.Conn) context.Context {
+		if baseConnContext != nil {
+			ctx = baseConnContext(ctx, conn)
+		}
+		return context.WithValue(ctx, acceptedConnContextKey{}, conn)
 	}
 
 	for _, f := range s.onShutdownFuncs {
