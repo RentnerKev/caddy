@@ -119,6 +119,28 @@ func (ctx Context) HoldCleanup() func() {
 	return release
 }
 
+// HoldLogging retains the configuration's log writers independently of its
+// modules. Call the returned function after every user of these loggers has
+// finished, including background work. The release function is idempotent.
+// Acquire before cancellation; a retired context cannot retain its writers.
+// This does not delay context cancellation or module cleanup.
+//
+// EXPERIMENTAL: This API is subject to change.
+func (ctx Context) HoldLogging() (func(), error) {
+	if ctx.cleanup == nil || ctx.Err() != nil {
+		return nil, fmt.Errorf("retaining log writers: context canceled or unavailable")
+	}
+	releaseCleanup, ok := ctx.cleanup.acquire()
+	if !ok {
+		return nil, fmt.Errorf("retaining log writers: context cleanup already requested")
+	}
+	defer releaseCleanup()
+	if ctx.cfg == nil || ctx.cfg.Logging == nil {
+		return func() {}, nil
+	}
+	return ctx.cfg.Logging.holdWriters()
+}
+
 // FileSystems returns a ref to the FilesystemMap.
 // EXPERIMENTAL: This API is subject to change.
 func (ctx *Context) FileSystems() FileSystems {

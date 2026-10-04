@@ -80,8 +80,10 @@ type Logging struct {
 	// that are opened to provision this logging config
 	// must have their keys added to this list so they
 	// can be closed when cleaning up
-	writerKeys []string
-	defaultLog *defaultCustomLog
+	writerKeys    []string
+	writerMu      sync.Mutex
+	writersClosed bool
+	defaultLog    *defaultCustomLog
 }
 
 // openLogs sets up the config and opens all the configured writers.
@@ -208,7 +210,12 @@ func (logging *Logging) setupNewDefault(ctx Context) error {
 // A successful call to openLogs calls this automatically
 // when the context is canceled.
 func (logging *Logging) closeLogs() error {
-	for _, key := range logging.writerKeys {
+	logging.writerMu.Lock()
+	keys := logging.writerKeys
+	logging.writerKeys = nil
+	logging.writersClosed = true
+	logging.writerMu.Unlock()
+	for _, key := range keys {
 		_, err := writers.Delete(key)
 		if err != nil {
 			log.Printf("[ERROR] Closing log writer %v: %v", key, err)
@@ -258,7 +265,14 @@ func (logging *Logging) openWriter(opener WriterOpener) (io.WriteCloser, bool, e
 	if err != nil {
 		return nil, false, err
 	}
+	logging.writerMu.Lock()
+	if logging.writersClosed {
+		logging.writerMu.Unlock()
+		_, _ = writers.Delete(key)
+		return nil, false, fmt.Errorf("logging configuration already closed")
+	}
 	logging.writerKeys = append(logging.writerKeys, key)
+	logging.writerMu.Unlock()
 	return writer.(io.WriteCloser), !loaded, nil
 }
 

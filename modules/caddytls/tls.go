@@ -35,7 +35,6 @@ import (
 	"go.uber.org/zap/zapcore"
 
 	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/internal"
 	"github.com/caddyserver/caddy/v2/modules/caddyevents"
 )
 
@@ -136,6 +135,7 @@ type TLS struct {
 	dns                any // technically, it should be any/all of the libdns interfaces (RecordSetter, RecordAppender, etc.)
 	certificateLoaders []CertificateLoader
 	automateNames      map[string]struct{}
+	cacheOwner         *certificateCacheOwner
 	ctx                caddy.Context
 	bgCtx              context.Context
 	bgCancel           context.CancelFunc
@@ -215,13 +215,11 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 		cacheOpts.Capacity = 10000
 	}
 
-	certCacheMu.Lock()
-	if certCache == nil {
-		certCache = certmagic.NewCache(cacheOpts)
-	} else {
-		certCache.SetOptions(cacheOpts)
+	owner, err := acquireCertificateCache(t, cacheOpts)
+	if err != nil {
+		return err
 	}
-	certCacheMu.Unlock()
+	t.cacheOwner = owner
 
 	// certificate loaders
 	val, err := ctx.LoadModule(t, "CertificatesRaw")
@@ -403,7 +401,15 @@ func (t *TLS) Validate() error {
 }
 
 // Start activates the TLS module.
-func (t *TLS) Start() error {
+func (t *TLS) Start() (err error) {
+	if t.cacheOwner != nil {
+		t.cacheOwner.start()
+		defer func() {
+			if err != nil {
+				t.cacheOwner.stop()
+			}
+		}()
+	}
 	// warn if on-demand TLS is enabled but no restrictions are in place
 	if t.Automation.OnDemand == nil || (t.Automation.OnDemand.Ask == "" && t.Automation.OnDemand.permission == nil) {
 		for _, ap := range t.Automation.Policies {
@@ -429,7 +435,7 @@ func (t *TLS) Start() error {
 
 	// now that we are running, and all manual certificates have
 	// been loaded, time to load the automated/managed certificates
-	err := t.Manage(t.automateNames)
+	err = t.Manage(t.automateNames)
 	if err != nil {
 		return fmt.Errorf("automate: managing %v: %v", t.automateNames, err)
 	}
@@ -503,6 +509,9 @@ func (t *TLS) Start() error {
 
 // Stop stops the TLS module and cleans up any allocations.
 func (t *TLS) Stop() error {
+	if t.cacheOwner != nil {
+		t.cacheOwner.stop()
+	}
 	// cancel all background goroutines (storage cleaner, ECH rotation/publication, etc.)
 	if t.bgCancel != nil {
 		t.bgCancel()
@@ -520,80 +529,23 @@ func (t *TLS) Stop() error {
 
 // Cleanup frees up resources allocated during Provision.
 func (t *TLS) Cleanup() error {
-	// stop the session ticket rotation goroutine
+	if t.cacheOwner != nil {
+		certCacheMu.Lock()
+		alreadyCleaned := t.cacheOwner.cleaning || t.cacheOwner.released
+		t.cacheOwner.cleaning = true
+		certCacheMu.Unlock()
+		if alreadyCleaned {
+			return nil
+		}
+		defer t.cacheOwner.release()
+	}
 	if t.SessionTickets != nil {
 		t.SessionTickets.stop()
 	}
-
-	// if a new TLS app was loaded, remove certificates from the cache that are no longer
-	// being managed or loaded by the new config; if there is no more TLS app running,
-	// then stop cert maintenance and let the cert cache be GC'ed
-	if nextTLS, err := caddy.ActiveContext().AppIfConfigured("tls"); err == nil && nextTLS != nil {
-		nextTLSApp := nextTLS.(*TLS)
-
-		// compute which certificates were managed or loaded into the cert cache by this
-		// app instance (which is being stopped) that are not managed or loaded by the
-		// new app instance (which just started), and remove them from the cache
-		var noLongerManaged []certmagic.SubjectIssuer
-		var noLongerLoaded []string
-		reManage := make(map[string]struct{})
-		for subj, currentIssuerKey := range t.managing {
-			// It's a bit nuanced: managed certs can sometimes be different enough that we have to
-			// swap them out for a different one, even if they are for the same subject/domain.
-			// We consider "private" certs (internal CA/locally-trusted/etc) to be significantly
-			// distinct from "public" certs (production CAs/globally-trusted/etc) because of the
-			// implications when it comes to actual deployments: switching between an internal CA
-			// and a production CA, for example, is quite significant. Switching from one public CA
-			// to another, however, is not, and for our purposes we consider those to be the same.
-			// Anyway, if the next TLS app does not manage a cert for this name at all, definitely
-			// remove it from the cache. But if it does, and it's not the same kind of issuer/CA
-			// as we have, also remove it, so that it can swap it out for the right one.
-			if nextIssuerKey, ok := nextTLSApp.managing[subj]; !ok || nextIssuerKey != currentIssuerKey {
-				// next app is not managing a cert for this domain at all or is using a different issuer, so remove it
-				noLongerManaged = append(noLongerManaged, certmagic.SubjectIssuer{Subject: subj, IssuerKey: currentIssuerKey})
-
-				// then, if the next app is managing a cert for this name, but with a different issuer, re-manage it
-				if ok && nextIssuerKey != currentIssuerKey {
-					reManage[subj] = struct{}{}
-				}
-			}
-		}
-		for hash := range t.loaded {
-			if _, ok := nextTLSApp.loaded[hash]; !ok {
-				noLongerLoaded = append(noLongerLoaded, hash)
-			}
-		}
-
-		// remove the certs
-		certCacheMu.RLock()
-		certCache.RemoveManaged(noLongerManaged)
-		certCache.Remove(noLongerLoaded)
-		certCacheMu.RUnlock()
-
-		// give the new TLS app a "kick" to manage certs that it is configured for
-		// with its own configuration instead of the one we just evicted
-		if err := nextTLSApp.Manage(reManage); err != nil {
-			if c := t.logger.Check(zapcore.ErrorLevel, "re-managing unloaded certificates with new config"); c != nil {
-				c.Write(
-					zap.Strings("subjects", internal.MaxSizeSubjectsListForLog(reManage, 1000)),
-					zap.Error(err),
-				)
-			}
-		}
-	} else {
-		// no more TLS app running, so delete in-memory cert cache, if it was created yet
-		certCacheMu.RLock()
-		hasCache := certCache != nil
-		certCacheMu.RUnlock()
-		if hasCache {
-			certCache.Stop()
-			certCacheMu.Lock()
-			certCache = nil
-			certCacheMu.Unlock()
-		}
+	if t.cacheOwner == nil {
+		return nil
 	}
-
-	return nil
+	return t.reconcileCachedCertificates()
 }
 
 // Manage immediately begins managing subjects according to the
@@ -603,6 +555,13 @@ func (t *TLS) Cleanup() error {
 // certain config parameters (with lots of subjects, computing
 // wildcard coverage over a slice can be highly inefficient).
 func (t *TLS) Manage(subjects map[string]struct{}) error {
+	return t.manage(t.ctx.Context, subjects, true)
+}
+
+func (t *TLS) manage(ctx context.Context, subjects map[string]struct{}, async bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// for a large number of names, we can be more memory-efficient
 	// by making only one certmagic.Config for all the names that
 	// use that config, rather than calling ManageAsync once for
@@ -627,7 +586,15 @@ func (t *TLS) Manage(subjects map[string]struct{}) error {
 	// certmagic.Config for each (potentially large) group of names
 	// and call ManageAsync just once for the whole batch
 	for ap, names := range policyToNames {
-		err := ap.magic.ManageAsync(t.ctx.Context, names)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var err error
+		if async {
+			err = ap.magic.ManageAsync(ctx, names)
+		} else {
+			err = ap.magic.ManageSync(ctx, names)
+		}
 		if err != nil {
 			const maxNamesToDisplay = 100
 			if len(names) > maxNamesToDisplay {
